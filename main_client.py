@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CogniLens Pi Main Client — Unified WebSocket connection.
-Handles audio, camera, gyro, and button in a single persistent session.
+Handles wake-word audio, voice-triggered camera actions, gyro, and live responses in a single persistent session.
 
 Dependencies on Pi:
     pip3 install websockets requests RPi.GPIO smbus2 picamera2
@@ -13,6 +13,8 @@ Usage:
 import asyncio
 import argparse
 import base64
+import re
+from difflib import SequenceMatcher
 import json
 import subprocess
 import tempfile
@@ -21,27 +23,28 @@ import time
 import threading
 import sys
 
+import requests
 import websockets
 import RPi.GPIO as GPIO
 
 # ── GPIO Pins ────────────────────────────────────────────────────────────────
-AUDIO_BUTTON_PIN  = 17   # Press → record voice query
-CAMERA_BUTTON_PIN = 27   # Press → capture image for scene analysis
-LED_PIN           = 22   # Status LED
-RECORD_SECONDS    = 5
-SAMPLE_RATE       = 16000
-MIC_DEVICE        = "hw:0,0"
-SPEAKER_DEVICE    = "hw:0,0"
+LED_PIN = 22  # Status LED
+RECORD_SECONDS = 5
+WAKE_LISTEN_SECONDS = 2
+WAKE_COOLDOWN_SECONDS = 1.5
+WAKE_CAMERA_DELAY_SECONDS = 10
+SAMPLE_RATE = 16000
+MIC_DEVICE = "plughw:1,0"
+SPEAKER_DEVICE = "plughw:1,0"
+WAKE_WORD = "hey cognilens"
 
 # ── State ─────────────────────────────────────────────────────────────────────
 is_recording = False
-is_playing   = False
+is_playing = False
 
 
 def setup_gpio():
     GPIO.setmode(GPIO.BCM)
-    GPIO.setup(AUDIO_BUTTON_PIN,  GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.setup(CAMERA_BUTTON_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
     GPIO.setup(LED_PIN, GPIO.OUT, initial=GPIO.LOW)
 
 
@@ -52,12 +55,25 @@ def led(state: bool):
         pass
 
 
-def record_audio_wav() -> bytes:
+def record_audio_wav(duration: int = RECORD_SECONDS) -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         path = f.name
-    cmd = ["arecord", "-D", MIC_DEVICE, "-f", "S16_LE",
-           "-r", str(SAMPLE_RATE), "-c", "1",
-           "-d", str(RECORD_SECONDS), "-t", "wav", path]
+    cmd = [
+        "arecord",
+        "-D",
+        MIC_DEVICE,
+        "-f",
+        "S16_LE",
+        "-r",
+        str(SAMPLE_RATE),
+        "-c",
+        "1",
+        "-d",
+        str(duration),
+        "-t",
+        "wav",
+        path,
+    ]
     led(True)
     subprocess.run(cmd, check=True, capture_output=True)
     led(False)
@@ -67,11 +83,78 @@ def record_audio_wav() -> bytes:
     return data
 
 
+def transcribe_audio_wav(server_url: str, audio_bytes: bytes) -> str:
+    try:
+        resp = requests.post(
+            f"{server_url}/audio/transcribe",
+            files={"audio": ("wake.wav", audio_bytes, "audio/wav")},
+            data={"language": "en"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return str(payload.get("text", "")).strip()
+    except Exception as exc:
+        print(f"⚠️  Wake-word transcription failed: {exc}")
+        return ""
+
+
+def normalize_text(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    return " ".join(cleaned.split())
+
+
+def looks_like_wake_word(transcript: str) -> bool:
+    normalized = normalize_text(transcript)
+    if not normalized:
+        return False
+
+    if WAKE_WORD in normalized:
+        return True
+
+    variants = (
+        "hey congnilens",
+        "hey cogni lens",
+        "hey congi lens",
+        "hey cognilens",
+    )
+    if any(variant in normalized for variant in variants):
+        return True
+
+    words = normalized.split()
+    if words and words[0] == "hey" and len(words) > 1:
+        if SequenceMatcher(None, words[1], "cognilens").ratio() >= 0.8:
+            return True
+
+    return SequenceMatcher(None, normalized[:18], WAKE_WORD).ratio() >= 0.85
+
+
+def classify_wake_command(transcript: str) -> str:
+    normalized = normalize_text(transcript)
+    if not looks_like_wake_word(normalized):
+        return ""
+
+    if "start camera" in normalized:
+        return "camera"
+
+    return "voice"
+
+
 def capture_image_jpeg() -> bytes:
     with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
         path = f.name
-    cmd = ["libcamera-jpeg", "-o", path, "--width", "640",
-           "--height", "480", "--nopreview", "-t", "200"]
+    cmd = [
+        "rpicam-jpeg",
+        "-o",
+        path,
+        "--width",
+        "640",
+        "--height",
+        "480",
+        "--nopreview",
+        "-t",
+        "200",
+    ]
     subprocess.run(cmd, check=True, capture_output=True)
     with open(path, "rb") as f:
         data = f.read()
@@ -85,10 +168,42 @@ def play_mp3_bytes(mp3_bytes: bytes):
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         f.write(mp3_bytes)
         path = f.name
-    subprocess.run(["mpg123", "-q", "-a", SPEAKER_DEVICE, path],
-                   check=False, capture_output=True)
+    subprocess.run(
+        ["mpg123", "-q", "-a", SPEAKER_DEVICE, path], check=False, capture_output=True
+    )
     os.unlink(path)
     is_playing = False
+
+
+async def send_audio_after_wake(ws, wav: bytes):
+    await ws.send(
+        json.dumps(
+            {
+                "type": "audio_chunk",
+                "data": base64.b64encode(wav).decode(),
+            }
+        )
+    )
+
+
+async def send_image_after_delay(ws, delay_seconds: int = WAKE_CAMERA_DELAY_SECONDS):
+    global is_recording
+    is_recording = True
+    try:
+        print(f"📷 Camera trigger detected. Capturing in {delay_seconds}s ...")
+        await asyncio.sleep(delay_seconds)
+        loop = asyncio.get_running_loop()
+        img = await loop.run_in_executor(None, capture_image_jpeg)
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "image",
+                    "data": base64.b64encode(img).decode(),
+                }
+            )
+        )
+    finally:
+        is_recording = False
 
 
 async def run_client(server_url: str):
@@ -96,8 +211,11 @@ async def run_client(server_url: str):
     setup_gpio()
     print(f"🔗 Connecting to {server_url} ...")
 
-    async with websockets.connect(f"{server_url}/ws/glasses?device_id=pi-glasses-01",
-                                  ping_interval=20, ping_timeout=10) as ws:
+    async with websockets.connect(
+        f"{server_url}/ws/glasses?device_id=pi-glasses-01",
+        ping_interval=20,
+        ping_timeout=10,
+    ) as ws:
         print("✅ Connected to CogniLens backend")
 
         # ── Listener task ─────────────────────────────────────────────────────
@@ -108,9 +226,9 @@ async def run_client(server_url: str):
                     mtype = msg.get("type", "")
 
                     if mtype == "audio_response":
-                        transcript    = msg.get("transcript", "")
+                        transcript = msg.get("transcript", "")
                         response_text = msg.get("response_text", "")
-                        audio_b64     = msg.get("audio_b64", "")
+                        audio_b64 = msg.get("audio_b64", "")
 
                         print(f"👤 You: {transcript}")
                         print(f"🤖 AI: {response_text}")
@@ -130,70 +248,88 @@ async def run_client(server_url: str):
                         print(f"📲 Command from app: {cmd}")
                         if cmd == "capture_scene":
                             img = capture_image_jpeg()
-                            await ws.send(json.dumps({
-                                "type": "image",
-                                "data": base64.b64encode(img).decode(),
-                            }))
+                            await ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "image",
+                                        "data": base64.b64encode(img).decode(),
+                                    }
+                                )
+                            )
                 except Exception as e:
                     print(f"⚠️  Message error: {e}")
 
-        # ── Button polling task ───────────────────────────────────────────────
-        async def poll_buttons():
-            audio_pressed  = False
-            camera_pressed = False
+        # ── Wake-word task ───────────────────────────────────────────────────
+        async def poll_wake_word():
+            global is_recording
+            cooldown_until = 0.0
+            loop = asyncio.get_running_loop()
 
             while True:
-                # Audio button
-                if GPIO.input(AUDIO_BUTTON_PIN) == GPIO.LOW:
-                    if not audio_pressed and not is_recording and not is_playing:
-                        audio_pressed = True
+                if is_playing or is_recording:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                if time.time() < cooldown_until:
+                    await asyncio.sleep(0.1)
+                    continue
+
+                print("👂 Listening for wake word ...")
+                try:
+                    is_recording = True
+                    wake_audio = await loop.run_in_executor(
+                        None, record_audio_wav, WAKE_LISTEN_SECONDS
+                    )
+                    is_recording = False
+
+                    transcript = await loop.run_in_executor(
+                        None, transcribe_audio_wav, server_url, wake_audio
+                    )
+
+                    command = classify_wake_command(transcript)
+                    if command == "camera":
+                        cooldown_until = time.time() + WAKE_COOLDOWN_SECONDS
+                        await send_image_after_delay(ws)
+                    elif command == "voice":
+                        print(
+                            f"✅ Wake word detected: {transcript or '[unintelligible]'}"
+                        )
+                        cooldown_until = time.time() + WAKE_COOLDOWN_SECONDS
+                        is_recording = True
                         print("🎙  Recording voice ...")
-                        try:
-                            wav = await asyncio.get_event_loop().run_in_executor(
-                                None, record_audio_wav)
-                            await ws.send(json.dumps({
-                                "type": "audio_chunk",
-                                "data": base64.b64encode(wav).decode(),
-                            }))
-                        except Exception as e:
-                            print(f"❌ Audio error: {e}")
-                else:
-                    audio_pressed = False
+                        wav = await loop.run_in_executor(
+                            None, record_audio_wav, RECORD_SECONDS
+                        )
+                        is_recording = False
+                        await send_audio_after_wake(ws, wav)
+                    elif transcript:
+                        print(f"… Heard: {transcript}")
+                except Exception as e:
+                    is_recording = False
+                    print(f"❌ Wake-word error: {e}")
+                    await asyncio.sleep(1)
 
-                # Camera button
-                if GPIO.input(CAMERA_BUTTON_PIN) == GPIO.LOW:
-                    if not camera_pressed:
-                        camera_pressed = True
-                        print("📸 Capturing scene ...")
-                        try:
-                            img = await asyncio.get_event_loop().run_in_executor(
-                                None, capture_image_jpeg)
-                            await ws.send(json.dumps({
-                                "type": "image",
-                                "data": base64.b64encode(img).decode(),
-                            }))
-                        except Exception as e:
-                            print(f"❌ Camera error: {e}")
-                else:
-                    camera_pressed = False
-
-                await asyncio.sleep(0.05)
-
-        # Run both tasks concurrently
-        await asyncio.gather(listen(), poll_buttons())
+        # Run the listener and wake-word detector concurrently
+        await asyncio.gather(listen(), poll_wake_word())
 
 
 def main():
     parser = argparse.ArgumentParser(description="CogniLens Pi Main Client")
-    parser.add_argument("--server", default="ws://localhost:8000",
-                        help="Backend WebSocket URL (ws://host:port)")
+    parser.add_argument(
+        "--server",
+        default="ws://localhost:8000",
+        help="Backend WebSocket URL (ws://host:port)",
+    )
     args = parser.parse_args()
 
-    while True:   # Auto-reconnect loop
+    while True:  # Auto-reconnect loop
         try:
             asyncio.run(run_client(args.server))
-        except (ConnectionRefusedError, websockets.exceptions.ConnectionClosed,
-                OSError) as e:
+        except (
+            ConnectionRefusedError,
+            websockets.exceptions.ConnectionClosed,
+            OSError,
+        ) as e:
             print(f"🔌 Disconnected ({e}). Reconnecting in 5s ...")
             time.sleep(5)
         except KeyboardInterrupt:

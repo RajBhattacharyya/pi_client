@@ -11,6 +11,8 @@ Dependencies on Pi:
     sudo apt install alsa-utils mpg123
 """
 import argparse
+import re
+from difflib import SequenceMatcher
 import subprocess
 import tempfile
 import os
@@ -21,19 +23,22 @@ import threading
 import RPi.GPIO as GPIO
 
 # ── Config ──────────────────────────────────────────────────────────────────
-RECORD_DURATION_SECONDS = 5       # How long to record per interaction
+RECORD_DURATION_SECONDS = 5  # How long to record per interaction
+WAKE_LISTEN_SECONDS = 2  # Short clips used to detect the wake word
+WAKE_COOLDOWN_SECONDS = 1.5  # Prevent double triggers after detection
 SAMPLE_RATE = 16000
 CHANNELS = 1
-AUDIO_FORMAT = "S16_LE"           # 16-bit little-endian
-CARD_INDEX = 0                    # ALSA card index (check with: arecord -l)
+AUDIO_FORMAT = "S16_LE"  # 16-bit little-endian
+CARD_INDEX = 0  # ALSA card index (check with: arecord -l)
 MIC_DEVICE = f"hw:{CARD_INDEX},0"
 SPEAKER_DEVICE = f"hw:{CARD_INDEX},0"
+WAKE_WORD = "hey cognilens"
 
 # GPIO button pin (wire a physical button between GPIO17 and GND)
 BUTTON_PIN = 17
-LED_PIN = 27   # Optional status LED
+LED_PIN = 27  # Optional status LED
 
-SESSION_ID = ""   # Will be set after first response
+SESSION_ID = ""  # Will be set after first response
 
 
 def setup_gpio():
@@ -56,12 +61,18 @@ def record_audio(duration: int = RECORD_DURATION_SECONDS) -> bytes:
 
     cmd = [
         "arecord",
-        "-D", MIC_DEVICE,
-        "-f", AUDIO_FORMAT,
-        "-r", str(SAMPLE_RATE),
-        "-c", str(CHANNELS),
-        "-d", str(duration),
-        "-t", "wav",
+        "-D",
+        MIC_DEVICE,
+        "-f",
+        AUDIO_FORMAT,
+        "-r",
+        str(SAMPLE_RATE),
+        "-c",
+        str(CHANNELS),
+        "-d",
+        str(duration),
+        "-t",
+        "wav",
         tmp_path,
     ]
     print(f"🎙  Recording for {duration}s ...")
@@ -75,6 +86,53 @@ def record_audio(duration: int = RECORD_DURATION_SECONDS) -> bytes:
     return data
 
 
+def transcribe_audio(server_url: str, audio_data: bytes) -> str:
+    """Send audio to the backend STT endpoint and return the transcript."""
+    try:
+        resp = requests.post(
+            f"{server_url}/audio/transcribe",
+            files={"audio": ("wake.wav", audio_data, "audio/wav")},
+            data={"language": "en"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        return str(payload.get("text", "")).strip()
+    except Exception as exc:
+        print(f"⚠️  Wake-word transcription failed: {exc}")
+        return ""
+
+
+def _normalize_text(text: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    return " ".join(cleaned.split())
+
+
+def _looks_like_wake_word(transcript: str) -> bool:
+    normalized = _normalize_text(transcript)
+    if not normalized:
+        return False
+
+    if WAKE_WORD in normalized:
+        return True
+
+    variants = (
+        "hey congnilens",
+        "hey cogni lens",
+        "hey congi lens",
+        "hey cognilens",
+    )
+    if any(variant in normalized for variant in variants):
+        return True
+
+    words = normalized.split()
+    if words and words[0] == "hey" and len(words) > 1:
+        if SequenceMatcher(None, words[1], "cognilens").ratio() >= 0.8:
+            return True
+
+    return SequenceMatcher(None, normalized[:18], WAKE_WORD).ratio() >= 0.85
+
+
 def play_audio_bytes(mp3_bytes: bytes):
     """Play MP3 audio bytes via PCM5102 using mpg123."""
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
@@ -83,17 +141,21 @@ def play_audio_bytes(mp3_bytes: bytes):
 
     print("🔊 Playing response ...")
     led(True)
-    subprocess.run(["mpg123", "-q", "-a", SPEAKER_DEVICE, tmp_path],
-                   check=False, capture_output=True)
+    subprocess.run(
+        ["mpg123", "-q", "-a", SPEAKER_DEVICE, tmp_path],
+        check=False,
+        capture_output=True,
+    )
     led(False)
     os.unlink(tmp_path)
 
 
-def send_and_play(server_url: str):
+def send_and_play(server_url: str, audio_data: bytes | None = None):
     """One full voice interaction cycle."""
     global SESSION_ID
     try:
-        audio_data = record_audio()
+        if audio_data is None:
+            audio_data = record_audio()
 
         print("📤 Sending to backend ...")
         files = {"audio": ("input.wav", audio_data, "audio/wav")}
@@ -125,6 +187,29 @@ def send_and_play(server_url: str):
         print(f"❌ Error: {e}")
 
 
+def run_wake_word_mode(server_url: str):
+    """Continuously listen for the wake word and start recording only after it."""
+    setup_gpio()
+    print("🟢 Wake-word mode: say 'Hey CogniLens' to start")
+    print(f"🌐 Backend: {server_url}")
+    try:
+        while True:
+            print("👂 Listening for wake word ...")
+            audio_data = record_audio(WAKE_LISTEN_SECONDS)
+            transcript = transcribe_audio(server_url, audio_data)
+
+            if _looks_like_wake_word(transcript):
+                print(f"✅ Wake word detected: {transcript or '[unintelligible]'}")
+                time.sleep(WAKE_COOLDOWN_SECONDS)
+                send_and_play(server_url)
+            elif transcript:
+                print(f"… Heard: {transcript}")
+    except KeyboardInterrupt:
+        print("\n👋 Stopping")
+    finally:
+        GPIO.cleanup()
+
+
 def run_button_mode(server_url: str):
     """Press physical button to trigger voice interaction."""
     setup_gpio()
@@ -134,10 +219,10 @@ def run_button_mode(server_url: str):
         while True:
             # Wait for button press (active LOW)
             if GPIO.input(BUTTON_PIN) == GPIO.LOW:
-                time.sleep(0.05)   # debounce
+                time.sleep(0.05)  # debounce
                 if GPIO.input(BUTTON_PIN) == GPIO.LOW:
                     send_and_play(server_url)
-                    time.sleep(0.5)   # prevent double-trigger
+                    time.sleep(0.5)  # prevent double-trigger
             time.sleep(0.02)
     except KeyboardInterrupt:
         print("\n👋 Stopping")
@@ -156,15 +241,23 @@ def run_continuous_mode(server_url: str, interval: int = 2):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CogniLens Audio Client")
-    parser.add_argument("--server", default="http://localhost:8000",
-                        help="Backend server URL")
-    parser.add_argument("--mode", choices=["button", "continuous"],
-                        default="button", help="Trigger mode")
-    parser.add_argument("--interval", type=int, default=2,
-                        help="Interval (seconds) in continuous mode")
+    parser.add_argument(
+        "--server", default="http://localhost:8000", help="Backend server URL"
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["wake", "button", "continuous"],
+        default="wake",
+        help="Trigger mode",
+    )
+    parser.add_argument(
+        "--interval", type=int, default=2, help="Interval (seconds) in continuous mode"
+    )
     args = parser.parse_args()
 
-    if args.mode == "button":
+    if args.mode == "wake":
+        run_wake_word_mode(args.server)
+    elif args.mode == "button":
         run_button_mode(args.server)
     else:
         run_continuous_mode(args.server, args.interval)
