@@ -29,14 +29,25 @@ import RPi.GPIO as GPIO
 
 # ── GPIO Pins ────────────────────────────────────────────────────────────────
 LED_PIN = 22  # Status LED
-RECORD_SECONDS = 5
-WAKE_LISTEN_SECONDS = 2
+RECORD_SECONDS = 10
+WAKE_LISTEN_SECONDS = 3
 WAKE_COOLDOWN_SECONDS = 1.5
 WAKE_CAMERA_DELAY_SECONDS = 10
 SAMPLE_RATE = 16000
 MIC_DEVICE = "plughw:1,0"
 SPEAKER_DEVICE = "plughw:1,0"
-WAKE_WORD = "hey cognilens"
+WAKE_WORD = "cognilens"
+WAKE_MIN_SIMILARITY = 0.72
+WAKE_VARIANTS = (
+    "cognilens",
+    "congnilens",
+    "cognilance",
+    "cognalance",
+    "ognilance",
+    "ognilens",
+    "congilens",
+    "cogni lens",
+)
 
 # ── State ─────────────────────────────────────────────────────────────────────
 is_recording = False
@@ -111,6 +122,14 @@ def normalize_text(text: str) -> str:
     return " ".join(cleaned.split())
 
 
+def _is_wake_token(token: str) -> bool:
+    if not token:
+        return False
+    if token in WAKE_VARIANTS:
+        return True
+    return SequenceMatcher(None, token, WAKE_WORD).ratio() >= WAKE_MIN_SIMILARITY
+
+
 def looks_like_wake_word(transcript: str) -> bool:
     normalized = normalize_text(transcript)
     if not normalized:
@@ -119,21 +138,20 @@ def looks_like_wake_word(transcript: str) -> bool:
     if WAKE_WORD in normalized:
         return True
 
-    variants = (
-        "hey congnilens",
-        "hey cogni lens",
-        "hey congi lens",
-        "hey cognilens",
-    )
-    if any(variant in normalized for variant in variants):
+    if any(variant in normalized for variant in WAKE_VARIANTS):
         return True
 
     words = normalized.split()
-    if words and words[0] == "hey" and len(words) > 1:
-        if SequenceMatcher(None, words[1], "cognilens").ratio() >= 0.8:
+    if any(_is_wake_token(word) for word in words):
+        return True
+
+    # Handle split transcription like "cogni lens".
+    for i in range(len(words) - 1):
+        merged = words[i] + words[i + 1]
+        if _is_wake_token(merged):
             return True
 
-    return SequenceMatcher(None, normalized[:18], WAKE_WORD).ratio() >= 0.85
+    return False
 
 
 def classify_wake_command(transcript: str) -> str:
@@ -141,7 +159,10 @@ def classify_wake_command(transcript: str) -> str:
     if not looks_like_wake_word(normalized):
         return ""
 
-    if "start camera" in normalized:
+    if any(
+        phrase in normalized
+        for phrase in ("start camera", "camera start", "open camera", "camera on")
+    ):
         return "camera"
 
     return "voice"

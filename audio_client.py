@@ -32,7 +32,7 @@ AUDIO_FORMAT = "S16_LE"  # 16-bit little-endian
 CARD_INDEX = 0  # ALSA card index (check with: arecord -l)
 MIC_DEVICE = f"hw:{CARD_INDEX},0"
 SPEAKER_DEVICE = f"hw:{CARD_INDEX},0"
-WAKE_WORD = "hey cognilens"
+WAKE_WORD = "cognilens"
 
 # GPIO button pin (wire a physical button between GPIO17 and GND)
 BUTTON_PIN = 17
@@ -120,7 +120,7 @@ def _looks_like_wake_word(transcript: str) -> bool:
         "hey congnilens",
         "hey cogni lens",
         "hey congi lens",
-        "hey cognilens",
+        "cognilens",
     )
     if any(variant in normalized for variant in variants):
         return True
@@ -190,7 +190,7 @@ def send_and_play(server_url: str, audio_data: bytes | None = None):
 def run_wake_word_mode(server_url: str):
     """Continuously listen for the wake word and start recording only after it."""
     setup_gpio()
-    print("🟢 Wake-word mode: say 'Hey CogniLens' to start")
+    print("🟢 Wake-word mode: say 'cognilens' to start")
     print(f"🌐 Backend: {server_url}")
     try:
         while True:
