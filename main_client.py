@@ -85,8 +85,15 @@ def record_audio_wav(duration: int = RECORD_SECONDS) -> bytes:
 
 def transcribe_audio_wav(server_url: str, audio_bytes: bytes) -> str:
     try:
+        # Wake-word STT uses HTTP even when the main connection is WebSocket.
+        rest_base_url = server_url.rstrip("/")
+        if rest_base_url.startswith("ws://"):
+            rest_base_url = "http://" + rest_base_url[len("ws://") :]
+        elif rest_base_url.startswith("wss://"):
+            rest_base_url = "https://" + rest_base_url[len("wss://") :]
+
         resp = requests.post(
-            f"{server_url}/audio/transcribe",
+            f"{rest_base_url}/audio/transcribe",
             files={"audio": ("wake.wav", audio_bytes, "audio/wav")},
             data={"language": "en"},
             timeout=20,
